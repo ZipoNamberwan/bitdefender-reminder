@@ -34,6 +34,7 @@ return new class extends Migration
             $table->string('id_bitdefender')->nullable();
             $table->string('nup')->nullable();
             $table->string('device_name')->nullable();
+            $table->string('user')->nullable();
             $table->dateTime('last_update_at')->nullable();
             $table->foreignUuid(column: 'organization_id')->nullable()->constrained('organizations');
             $table->foreignId(column: 'status_id')->nullable()->constrained('statuses');

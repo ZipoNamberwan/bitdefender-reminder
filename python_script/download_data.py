@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -11,6 +13,10 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import requests
+try:
+    import pymysql  # type: ignore[import-not-found]
+except ImportError:
+    pymysql = None
 from openpyxl import Workbook
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -18,6 +24,13 @@ load_dotenv(BASE_DIR / '.env', override=True)
 
 USERNAME = os.getenv("USERNAME")
 PASSWORD = os.getenv("PASSWORD")
+
+DB_CONNECTION = os.getenv("DB_CONNECTION", "mysql")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_DATABASE = os.getenv("DB_DATABASE", "")
+DB_USERNAME = os.getenv("DB_USERNAME", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 # ── Step 1: Login via Selenium and capture the first API request ─────────────
 
@@ -261,7 +274,15 @@ def flatten_record(data, parent_key='', output=None):
 
 def build_export_row(parent_node_name, child_record):
     row = {'parent_node_name': parent_node_name}
-    row.update(flatten_record(child_record if isinstance(child_record, dict) else {}))
+    source = child_record if isinstance(child_record, dict) else {}
+    row.update(flatten_record(source))
+
+    specifics = source.get('specifics', {}) if isinstance(source, dict) else {}
+    endpoint_users = specifics.get('endpointUsers', {}) if isinstance(specifics, dict) else {}
+    user_names, last_updates = extract_endpoint_users_fields(endpoint_users)
+    row['normalized.user'] = user_names
+    row['normalized.last_update_at'] = last_updates
+
     return row
 
 
@@ -281,6 +302,152 @@ def save_to_excel(records, output_path):
     workbook.save(output_path)
 
 
+def parse_datetime(value):
+    if not value:
+        return None
+
+    if isinstance(value, str):
+        # If there are multiple values joined by separator, use the first non-empty value.
+        value = next((part.strip() for part in value.split('|') if part.strip()), '')
+
+    if not value:
+        return None
+
+    normalized = str(value).strip()
+    if normalized.endswith('Z'):
+        normalized = normalized[:-1]
+
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def get_organization_code(parent_node_name):
+    text = str(parent_node_name or '')
+    return text[:4] if text else ''
+
+
+def sync_to_database(records):
+    if DB_CONNECTION.lower() != 'mysql':
+        raise ValueError(f"Unsupported DB_CONNECTION: {DB_CONNECTION}")
+
+    if pymysql is None:
+        raise ImportError('Missing dependency: pymysql. Install with "pip install pymysql".')
+
+    if not DB_DATABASE:
+        raise ValueError('DB_DATABASE is empty in .env')
+
+    connection = pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USERNAME,
+        password=DB_PASSWORD,
+        database=DB_DATABASE,
+        cursorclass=pymysql.cursors.DictCursor,
+        charset='utf8mb4',
+        autocommit=False,
+    )
+
+    inserted = 0
+    updated = 0
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT id, long_code FROM organizations')
+            organization_map = {
+                str(row['long_code']): row['id']
+                for row in cursor.fetchall()
+                if row.get('long_code')
+            }
+
+            cursor.execute("SELECT id FROM statuses WHERE name = %s LIMIT 1", ('Aktif',))
+            active_status = cursor.fetchone()
+            active_status_id = active_status['id'] if active_status else 1
+
+            for record in records:
+                id_bitdefender = record.get('_id')
+                if not id_bitdefender:
+                    continue
+
+                organization_code = get_organization_code(record.get('parent_node_name'))
+                organization_id = organization_map.get(organization_code)
+
+                nup_value = record.get('specifics.label') or None
+                device_name_value = record.get('specifics.dnsHostName') or None
+                user_value = record.get('normalized.user') or None
+                last_update_at = parse_datetime(record.get('normalized.last_update_at'))
+
+                cursor.execute(
+                    'SELECT id FROM devices WHERE id_bitdefender = %s LIMIT 1',
+                    (id_bitdefender,),
+                )
+                existing = cursor.fetchone()
+
+                if existing:
+                    cursor.execute(
+                        '''
+                        UPDATE devices
+                        SET
+                            nup = %s,
+                            device_name = %s,
+                            user = %s,
+                            last_update_at = %s,
+                            organization_id = %s,
+                            updated_at = NOW()
+                        WHERE id_bitdefender = %s
+                        ''',
+                        (
+                            nup_value,
+                            device_name_value,
+                            user_value,
+                            last_update_at,
+                            organization_id,
+                            id_bitdefender,
+                        ),
+                    )
+                    updated += 1
+                    continue
+
+                cursor.execute(
+                    '''
+                    INSERT INTO devices (
+                        id,
+                        id_bitdefender,
+                        nup,
+                        device_name,
+                        user,
+                        last_update_at,
+                        organization_id,
+                        status_id,
+                        created_by,
+                        created_at,
+                        updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    ''',
+                    (
+                        str(uuid.uuid4()),
+                        id_bitdefender,
+                        nup_value,
+                        device_name_value,
+                        user_value,
+                        last_update_at,
+                        organization_id,
+                        active_status_id,
+                        'system',
+                    ),
+                )
+                inserted += 1
+
+        connection.commit()
+        print(f'Database sync complete. inserted={inserted}, updated={updated}')
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def main():
     all_records = []
     visited_nodes = set()
@@ -296,6 +463,7 @@ def main():
     output_path = Path(__file__).resolve().parent / 'all_read_records.xlsx'
     save_to_excel(all_records, output_path)
     print(f'Saved {len(all_records)} records to: {output_path}')
+    sync_to_database(all_records)
 
 
 if __name__ == '__main__':
